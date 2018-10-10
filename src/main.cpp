@@ -1,4 +1,5 @@
 #include <Arduino.H>
+#include <Filter.h>
 
 const int buttonPin = 53;
 const int knobPin = 0;
@@ -7,6 +8,11 @@ const int openPin = 22;
 const int closePin = 23;
 const byte cmd = 0xFE; // pre-command control character
 
+int fullClose = 610;  // value when gate is shut
+int fullOpen = 105;   // value when gate is open
+float m, b, pct;      // for scaling positionValue to %
+long lPct;
+
 bool buttonState = false;
 bool lastButtonState = false;
 bool cmdOp = false;
@@ -14,6 +20,7 @@ bool cmdCl = false;
 byte digit = 0x00;
 int  knobSP = 0;
 int  knobValue = 0;
+ExponentialFilter<long> knobFilter(40,0);
 
 void displayPower(bool power) {
   Serial3.write(cmd);
@@ -92,12 +99,16 @@ void displayRshift() {
 
 void displayDraw(bool op, bool cl, int pv, int sp) {
     // 1: 00-13, 2: 40-53, 3: 14-27, 4: 54-67
-    displayCls();
     if (op) {
       displayPos(0x00); // 0,0
       Serial3.write(0x7E); // right
       Serial3.write(0x20); // space
       Serial3.write(0x7F); // left
+    } else {
+      displayPos(0x03);
+      displayBack();
+      displayBack();
+      displayBack();
     }
 
     if (cl) {
@@ -105,6 +116,11 @@ void displayDraw(bool op, bool cl, int pv, int sp) {
       Serial3.write(0x7F); // left
       Serial3.write(0x20); // space
       Serial3.write(0x7E); // right
+    } else {
+      displayPos(0x57);
+      displayBack();
+      displayBack();
+      displayBack();
     }
 
     displayPos(0x4C); // 2,(20-8)
@@ -145,11 +161,20 @@ void setup() {
   pinMode(closePin, OUTPUT);
 }
 
-
 void loop() {
   knobValue = analogRead(knobPin);
+  knobFilter.Filter(knobValue);
+  Serial.print(knobFilter.Current());
+  Serial.print(" ");
+  Serial.print(knobValue);
+  Serial.print(" ");
   buttonState = digitalRead(buttonPin);
-
+  m = 100.0/(fullClose - fullOpen);
+  b = -m * fullOpen;
+  if (knobValue < fullOpen) { knobValue = fullOpen; }
+  else if (knobValue > fullClose){ knobValue = fullClose; }
+  Serial.println(knobValue);
+  pct = (knobValue * m) + b;
   if (buttonState == HIGH) {
     digitalWrite(ledPin, HIGH);
     knobSP = knobValue;
@@ -157,7 +182,7 @@ void loop() {
     digitalWrite(ledPin, LOW);
   }
 
-  int pvpct = knobValue/10.24;
+  int pvpct = pct;
   int sppct = knobSP/10.24;
   if (pvpct > sppct) {
     cmdOp = false;
