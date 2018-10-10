@@ -1,36 +1,44 @@
-#include <Arduino.H>
+#include <Arduino.h>
 #include <Filter.h>
+#include <EEPROM.h> // Settings storage based on https://gitlab.com/snippets/1728275
 
-ExponentialFilter<long> pvSmooth(20,0);
-ExponentialFilter<long> spSmooth(30,0);
+struct eeprom_config {
+  int fullyClosed;
+  int fullyOpened;
+  int fullyOn;
+  int fullyOff;
+  int hysH;
+  int hysL;
+  long pvSmoothWeight;
+  long spSmoothWeight;
+  int ver;
+  unsigned int checksum;
+};
 
-const int pinButton = 53;
+ExponentialFilter<long> pvSmooth(80,0);
+ExponentialFilter<long> spSmooth(80,0);
+
 const int pinSP     = 0;
 const int pinPV     = 1;
-const int pinStatus = 13;
-const int pinMOp    = 7; // motor open signal, relay1
-const int pinMCl    = 6; // motor close signal, relay2
+const int pinMCl    = 6; // motor close signal
+const int pinMOp    = 7; // motor open signal
 const int pinOff    = 24; // NC switch so break = off
+const int pinMenu   = 46;
+const int pinSelect = 47;
 const byte cmd = 0xFE; // LCD escape character
 
 // parameters
-int fullyClosed = 610; // levels as tested 9/10/2018
-int fullyOpened = 105;
-int fullyOn     = 993; // pot max/min readings
-int fullyOff    = 53;
-int hysH        = 2;
-int hysL        = 2;
-
+eeprom_config settings; // setting struct
 long pctSP;
 long pctPV;
-bool buttonState = false;
-bool lastButtonState = false;
+//bool buttonState = false;
+//bool lastButtonState = false;
 bool cmdOp = false;
 bool cmdCl = false;
 bool isOff = true; // From on/off DPDT switch that disconnects open signal
 int valSP = 0;
 int valPV = 0;
-
+bool configError = false;
 
 void lcdPower(bool power) {
   Serial3.write(cmd);
@@ -150,21 +158,19 @@ void lcdDraw(bool op, bool cl, int pv, int sp, bool enabled) {
   else {          // draw arrows as directed
     if (op) {     // draw open arrows
       lcdPos(0x00); // 0,0
-      Serial3.write(0x7E); // right
-      Serial3.write(0x20); // space
-      Serial3.write(0x7F); // left
+      Serial3.write(0x7F); // right
+      Serial3.print("O");
+      Serial3.write(0x7E); // left
     }
     else {        // erase open arrows
       lcdPos(0x03);
-      lcdBack();
-      lcdBack();
-      lcdBack();
+      lcdBack(); lcdBack(); lcdBack();
     }
     if (cl) {     // draw close arrows
       lcdPos(0x54); // 4,0
-      Serial3.write(0x7F); // left
-      Serial3.write(0x20); // space
-      Serial3.write(0x7E); // right
+      Serial3.write(0x7E); // left
+      Serial3.print("C");// Serial3.write(0x20); // space
+      Serial3.write(0x7F); // right
     }
     else {        // erase close arrows
       lcdPos(0x57);
@@ -197,6 +203,75 @@ void lcdDraw(bool op, bool cl, int pv, int sp, bool enabled) {
   Serial3.write("%");
 }
 
+void defaultConfig() {
+  settings.fullyClosed = 610;
+  settings.fullyOpened = 105;
+  settings.fullyOn     = 993;
+  settings.fullyOff    = 53;
+  settings.hysH        = 5;
+  settings.hysL        = 5;
+  settings.pvSmoothWeight = 20;
+  settings.spSmoothWeight = 80;
+  settings.ver         = 0;
+}
+void loadConfig() {
+  Serial.print("Loading config: checksum ");
+  settings.checksum = 0;
+  unsigned int sum = 0;
+  unsigned char t;
+  for(unsigned int i=0; i<sizeof(settings); i++) {
+    t = (unsigned char)EEPROM.read(i);
+    *((char *)&settings + i) = t;
+    if(i < sizeof(settings) - sizeof(settings.checksum)) {
+      sum = sum + t;
+    }
+  }
+  Serial.println(sum);
+  if(settings.checksum != sum) {
+    Serial.println("Checksum fail, loading default config");
+    configError = true;
+    defaultConfig();
+  }
+  Serial.print("Closed: \t");
+  Serial.println(settings.fullyClosed);
+  Serial.print("Opened: \t");
+  Serial.println(settings.fullyOpened);
+  Serial.print("On: \t\t");
+  Serial.println(settings.fullyOn);
+  Serial.print("Off: \t\t");
+  Serial.println(settings.fullyOff);
+  Serial.print("Hys H/L: \t");
+  Serial.print(settings.hysH);
+  Serial.print("/");
+  Serial.println(settings.hysL);
+  Serial.print("Weight SP/PV: \t");
+  Serial.print(settings.spSmoothWeight);
+  Serial.print("/");
+  Serial.println(settings.pvSmoothWeight);
+  Serial.print("checksum: \t");
+  Serial.println(settings.checksum);
+
+  pvSmooth.SetWeight(settings.pvSmoothWeight);
+  spSmooth.SetWeight(settings.spSmoothWeight);
+}
+void saveConfig() {
+  Serial.print("Saving config: checksum ");
+  unsigned int sum = 0;
+  unsigned char t;
+  for(unsigned int i = 0; i < sizeof(eeprom_config); i++) {
+    if(i == sizeof(settings) - sizeof(settings.checksum)) {
+      settings.checksum = sum;
+    }
+    t = *((unsigned char*)&settings + i);
+    if(i < sizeof(settings) - sizeof(settings.checksum)) {
+      /* Don't checksum the checksum! */
+      sum = sum + t;
+    }
+    EEPROM.write(i, t);
+  }
+  Serial.println(sum);
+}
+
 int scale(int current, int high, int low) {
     if (high < low) {
       if (current < high) { current = high; }
@@ -218,9 +293,11 @@ void setup() {
     Serial.println("Initializing I/O...");
     pinMode(pinMOp, OUTPUT);
     pinMode(pinMCl, OUTPUT);
-    digitalWrite(pinMOp, HIGH);
-    digitalWrite(pinMCl, HIGH);
-    pinMode(pinButton, INPUT);
+    digitalWrite(pinMOp, LOW);
+    digitalWrite(pinMCl, LOW);
+    //    pinMode(pinButton, INPUT);
+    pinMode(pinMenu, INPUT_PULLUP);
+    pinMode(pinSelect, INPUT_PULLUP);
     pinMode(pinPV, INPUT);
     pinMode(pinSP, INPUT);
     pinMode(pinOff, INPUT_PULLUP);
@@ -235,6 +312,12 @@ void setup() {
     lcdCustom(0x03, 0x1C, 0x1C, 0x1C, 0x1C, 0x1C, 0x1C, 0x1C, 0x1C); // left
     lcdCustom(0x04, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07); // right
     lcdClear();
+    Serial.println("Load settings");
+    //TODO loadConfig();
+    defaultConfig();
+    lcdClear();
+    //if(configError) saveConfig();
+
     // Serial3.print("0"); // gibberish
     // Serial3.write(0x00);
     // Serial3.print("1");
@@ -250,37 +333,53 @@ void setup() {
 }
 
 void loop() {
-    //pvSmooth.Filter(analogRead(pinPV));
     spSmooth.Filter(analogRead(pinSP));
-    pctSP = scale(spSmooth.Current(),fullyOff,fullyOn);
-    pctPV = 68; // DEBUG scale(pvSmooth.Current(),fullyOpened,fullyClosed);
-    Serial.print(spSmooth.Current());
-    Serial.print(" = ");
-    Serial.print(pctSP);
-    Serial.print(". PV=");
-    Serial.print(pctPV);
-
-    if (pctSP + hysH <= pctPV) { // Valve too far open beyond hyst
+    pvSmooth.Filter(analogRead(pinPV));
+    pctSP = scale(spSmooth.Current(),settings.fullyOff,settings.fullyOn);
+    //pctPV = settings.ver;
+    pctPV = 100 - scale(pvSmooth.Current(),settings.fullyOpened,settings.fullyClosed);
+    // Serial.print("SP: ");
+    // Serial.print(spSmooth.Current());
+    // Serial.print(" = ");
+    // Serial.print(pctSP);
+    // Serial.print(". PV: ");
+    // Serial.print(pvSmooth.Current());
+    // Serial.print(" = ");
+    // Serial.println(pctPV);
+//    if(digitalRead(pinButton)==HIGH) {
+    //  pctPV = pctSP;
+    //  settings.ver = pctSP;
+    //  saveConfig();
+    //  lcdClear();
+    //}
+    //if (!cmdOp && )
+    if (pctSP + settings.hysH <= pctPV) { // Valve too far open beyond hyst
       cmdOp = false;
       cmdCl = true;
-      Serial.println(". ==>Close<==");
-    } else if (pctSP - hysL >= pctPV) { // Valve too far closed
+      // Serial.println(". ==>Close<==");
+    } else if (pctSP - settings.hysL >= pctPV) { // Valve too far closed
       cmdOp = true;
       cmdCl = false;
-      Serial.println(". <==Open==>");
+      // Serial.println(". <==Open==>");
     } else {
       cmdOp = false;
       cmdCl = false;
-      Serial.println(". <>HOLD<>");
+      // Serial.println(". <>HOLD<>");
     }
+
     if (!isOff && digitalRead(pinOff)) { // switch has changed to OFF
       isOff = true;
     } else if (isOff && !digitalRead(pinOff)) { // switch changed to ON
       isOff = false;
       lcdClear();
     }
-    digitalWrite(pinMOp, !cmdOp);
-    digitalWrite(pinMCl, !cmdCl);
+
+    // if (cmdOp) { digitalWrite(pinMOp, LOW); }
+      // else { digitalWrite(pinMOp, HIGH); }
+    // if (cmdCl) { digitalWrite(pinMCl, LOW); }
+      // else { digitalWrite(pinMCl, HIGH); }
+    digitalWrite(pinMOp, cmdOp);
+    digitalWrite(pinMCl, cmdCl);
     lcdDraw(cmdOp, cmdCl, pctPV, pctSP, !isOff);
-    delay(250);
+    // delay(250);
 }
