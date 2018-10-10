@@ -58,8 +58,8 @@ bool moving = false;
 bool cmdOp = false; // send Open signal
 bool cmdCl = false; // send Close signal
 bool isOff = true;  // Main toggle switch PIN_ENABLE
-bool configError = true;// error loading from EEPROM
-bool needCalibration = false;
+bool configError = true;// error loading from EEPROM TODO: display error
+bool needCalibration = false; // TODO: display error
 bool menuMode = false;  //
 menus menuPage;     // Current menu page for button logic
 int menuButton = 0; // button status 0=up, 1=short, 2=long
@@ -323,7 +323,6 @@ int checkMenuButton() {
     } else {                              //  in the past & being held
       if((millis() - pressTime > longPressM) && !fired) { // time is up and we haven't fired yet
         fired = true;                     //      set fired flag to prevent repeat
-        Serial.print("menL");
         return 2;                         //      return long signal
       }
       return 0;                           //    time's not up, carry on
@@ -332,7 +331,6 @@ int checkMenuButton() {
     if(prevState == LOW) {                //   and it was pressed before
       prevState = HIGH;                   //     clear pressed flag
       if((millis() - pressTime > shortPress) && !fired) { // short time had passed but not long
-        Serial.print("menS");
         return 1;                         //       return short signal
       }
       return 0;
@@ -359,7 +357,6 @@ int checkSelButton() {
     } else {                              //  in the past & being held
       if((millis() - pressTime > longPressS) && !fired) { // time is up and we haven't fired yet, now w/ rollover protection
         fired = true;                     //      set fired flag to prevent repeat
-        Serial.print("selL");
         return 2;                         //      return long signal
       }
       return 0;                           //    time's not up, carry on
@@ -368,7 +365,6 @@ int checkSelButton() {
     if(prevState == LOW) {                //   and it was pressed before
       prevState = HIGH;                   //     clear pressed flag
       if((millis() - pressTime > shortPress) && !fired) { // short time had passed but not long, now w/ rollover protection
-        Serial.print("selS");
         return 1;                         //       return short signal
       }
       return 0;
@@ -689,7 +685,7 @@ void loop() {
   else if(rawError < 0) { msError = abs(rawError/rateCl); }// or ms (closing)
   else { msError = 0; }                               // that really shouldn't happen
   Serial.println(); Serial.print("Loop "); Serial.print(loopcount);
-  Serial.print("- SP "); Serial.print(spSmooth.Current());
+  Serial.print(" - SP "); Serial.print(spSmooth.Current());
   Serial.print(" PV "); Serial.print(pvSmooth.Current());
   Serial.print(" raw "); Serial.print(rawError);
   Serial.print(" pct "); Serial.print(pctError);
@@ -709,13 +705,13 @@ void loop() {
     }
   } // not addressed: moving & out of position, stopped & in position
 
-  if(moving) {                  // ACTIVE? Calc PTC & direction, update relays
+  if(moving) {                  // ACTIVE? Calc direction, update relays
     if (pctSP > pctPV) {                      //  determine direction & set cmd flags
       cmdOp = true; cmdCl = false; Serial.print("open");
      } else if (pctSP < pctPV) {
       cmdCl = true; cmdOp = false; Serial.print("close");
      } else {                         //   shouldn't get here logically, but CYA
-      cmdCl = false; cmdOp = false; Serial.print("fork");
+      cmdCl = false; cmdOp = false; Serial.print("fork!");
     }
     digitalWrite(PIN_MOP, HIGH && cmdOp);
     digitalWrite(PIN_MCL, HIGH && cmdCl);
