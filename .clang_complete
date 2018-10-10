@@ -1,18 +1,17 @@
 -IC:\Users\Y714471\.platformio\packages\framework-arduinoavr\cores\arduino
 -IC:\Users\Y714471\.platformio\packages\framework-arduinoavr\variants\mega
--IH:\Data\My Documents\Arduino\libraries\MLP-master
--IH:\Data\My Documents\Arduino\libraries\MLP-master\utility
--IC:\Users\Y714471\.platformio\packages\framework-arduinoavr\libraries\__cores__\arduino\EEPROM\src
--IC:\Users\Y714471\.platformio\packages\framework-arduinoavr\libraries\__cores__\arduino\SPI\src
--IC:\Users\Y714471\.platformio\packages\framework-arduinoavr\libraries\WiFi\src
 -IH:\Data\My Documents\Arduino\libraries\AutoPID
 -IH:\Data\My Documents\Arduino\libraries\Eventually\src
+-IH:\Data\My Documents\Arduino\libraries\MLP-master
+-IH:\Data\My Documents\Arduino\libraries\MLP-master\utility
 -IH:\Data\My Documents\Arduino\libraries\NewHavenLCD
 -IH:\Data\My Documents\Arduino\libraries\PID_AutoTune_v0
 -IH:\Data\My Documents\Arduino\libraries\arduino_584708
 -IC:\Users\Y714471\.platformio\lib\PID-AutoTune_ID3
 -IC:\Users\Y714471\.platformio\lib\PID_ID2
+-IC:\Users\Y714471\.platformio\packages\framework-arduinoavr\libraries\__cores__\arduino\EEPROM\src
 -IC:\Users\Y714471\.platformio\packages\framework-arduinoavr\libraries\__cores__\arduino\HID\src
+-IC:\Users\Y714471\.platformio\packages\framework-arduinoavr\libraries\__cores__\arduino\SPI\src
 -IC:\Users\Y714471\.platformio\packages\framework-arduinoavr\libraries\__cores__\arduino\SoftwareSerial\src
 -IC:\Users\Y714471\.platformio\packages\framework-arduinoavr\libraries\__cores__\arduino\Wire\src
 -IC:\Users\Y714471\.platformio\packages\framework-arduinoavr\libraries\Adafruit_CircuitPlayground
@@ -35,6 +34,7 @@
 -IC:\Users\Y714471\.platformio\packages\framework-arduinoavr\libraries\Stepper\src
 -IC:\Users\Y714471\.platformio\packages\framework-arduinoavr\libraries\TFT\src
 -IC:\Users\Y714471\.platformio\packages\framework-arduinoavr\libraries\Temboo\src
+-IC:\Users\Y714471\.platformio\packages\framework-arduinoavr\libraries\WiFi\src
 -IC:\Users\Y714471\.platformio\packages\toolchain-atmelavr\avr\include
 -IC:\Users\Y714471\.platformio\packages\toolchain-atmelavr\lib\gcc\avr\4.9.2\include
 -IC:\Users\Y714471\.platformio\packages\toolchain-atmelavr\lib\gcc\avr\4.9.2\include-fixed
