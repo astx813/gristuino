@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Filter.h>
 #include <EEPROM.h> // Settings storage based on https://gitlab.com/snippets/1728275
+#include <PID_v1.h>
 
 #define PIN_PV          0
 #define PIN_SP          1
@@ -43,11 +44,12 @@ struct eeprom_config {
 // parameters
 ExponentialFilter<long> pvSmooth(80,0);
 ExponentialFilter<long> spSmooth(80,0);
+
 eeprom_config settings;
 int valSP = 0;      // SP pot raw value
-int pctSP = 0;      // SP scaled to %
+double pctSP = 0;      // SP scaled to %
 int valPV = 0;      // PV pot raw value
-int pctPV = 0;      // PV scaled to %
+double pctPV = 0;      // PV scaled to %
 bool cmdOp = false; // send Open signal
 bool cmdCl = false; // send Close signal
 bool isOff = true;  // Main toggle switch PIN_OFF
@@ -61,13 +63,23 @@ unsigned int longPressM = LONG_PRESS;      // Menu button long press ms
 unsigned int longPressS = LONGLONG_PRESS;  // Sel button long press ms
 bool displayChange = true;        // flag to trigger redraw
 
+// PID additions
+double pidProportion = 0;
+double Kp =0.5, Ki=0.5, Kd=0;
+double pvError = 0;
+PID gatePID(&pctPV, &pidProportion, &pctSP, Kp, Ki, Kd, P_ON_M, DIRECT);
+unsigned int windowSize = 2500;      // How long of a PTC window. Op/Cl ratio will be of this time
+unsigned long windowStart;  // Start time of current PTC window
+unsigned long loopStart;    // DEBUG
+bool pidMode = MANUAL;
+
 void defaultConfig() {
   settings.fullyClosed = 610;
   settings.fullyOpened = 105;
   settings.fullyOn     = 993;
   settings.fullyOff    = 53;
-  settings.hysH        = 5;
-  settings.hysL        = 5;
+  settings.hysH        = 1;
+  settings.hysL        = 1;
   settings.pvSmoothWeight = 60;
   settings.spSmoothWeight = 80;
   settings.ver         = 0;
@@ -555,14 +567,21 @@ void setup() {
     lcdCustom(0x03, 0x1C, 0x1C, 0x1C, 0x1C, 0x1C, 0x1C, 0x1C, 0x1C); // left
     lcdCustom(0x04, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07); // right
 
-    // load parameters
+    // load EEPROM configuration
     lcdPos(0x14); Serial3.print("  Loading settings");
     lcdPos(0x14);
     loadConfig();
-    // initialize smoothing filters
     lcdClear();
+
+    // activate PID
+    gatePID.SetOutputLimits(-windowSize,windowSize);
+    // gatePID.SetSampleTime(250); // default is already 100
+    gatePID.SetMode(pidMode);
+
+    // Ready to rock!
+    windowStart = millis();
     Serial.print("Startup complete after ");
-    Serial.print(millis());
+    Serial.print(windowStart);
     Serial.println("ms");
 }
 
@@ -588,18 +607,64 @@ void loop() {
 
   // only non-menu mode stuff below here
   pctSP = map(spSmooth.Current(),settings.fullyOff,settings.fullyOn,0,100);
-  // TODO does this make for a negative pct on PV?
   pctPV = map(pvSmooth.Current(),settings.fullyClosed,settings.fullyOpened,0,100);
+  //pvError = abs(pctSP - pctPV);   // how far out of position are we either way?
+  gatePID.Compute();
+  Serial.print(pidProportion);
+  // TODO get rid of H & L?
+  // if(!cmdOp && !cmdCl && (pvError > settings.hysH)) { // holding out of position
+  pidMode = gatePID.GetMode();
+  if(pidMode==MANUAL && (pvError > settings.hysH)) { // stopped & out of position
+    Serial.print("Enabling ");
+    pidMode = AUTOMATIC;                             //  start moving
+    gatePID.SetMode(pidMode);
+    gatePID.Compute();
+    // BAD BAD BAD TODO: direction can't change while PID is active
+    // if (pctSP > pctPV) {                              //   in the right direction
+    //   cmdOp = true; cmdCl = false;
+    // } else if (pctSP < pctPV) {
+    //   cmdCl = true; cmdOp = false;
+    // }
+  } else if((pidMode==AUTOMATIC) && (pidProportion < 125)) { // moving & less than one frame out of position
+    Serial.println("PID off");
+    pidMode = MANUAL;                           //  quit moving
+    gatePID.SetMode(pidMode);
+  } // not addressed: moving & out of position, stopped & in position
 
-  if(pctSP + settings.hysH <= pctPV) { //too far open
-    cmdOp = false;
-    cmdCl = true;
-  } else if (pctSP - settings.hysL >= pctPV) { // too far closed
-    cmdOp = true;
-    cmdCl = false;
+  if(pidMode == AUTOMATIC) {    // Still moving, cuz we would have stopped if in range
+    if (pctSP > pctPV) {                              //   set direction
+      cmdOp = true; cmdCl = false;
+    } else if (pctSP < pctPV) {
+      cmdCl = true; cmdOp = false;
+    }
   } else {
+    cmdOp = false; cmdCl = false;                      //  in either direction
+    pidProportion = 0;
+  }
+  if(isOff) {         // override everything, turn PID back off
+    pidMode = MANUAL;
+    gatePID.SetMode(pidMode);
+    digitalWrite(PIN_MOP, LOW);
+    digitalWrite(PIN_MCL, LOW);
     cmdOp = false;
     cmdCl = false;
+  }
+// DEBUG
+  // if (millis() - windowStart > 100) {
+  //   Serial.println(millis()-windowStart);
+  // }
+  if(pidMode == AUTOMATIC) {
+    gatePID.Compute();
+    if (millis() - windowStart > windowSize) { //time to shift the Relay Window
+      windowStart += windowSize;                 // shift window from end time, not now time
+    }
+    if (pidProportion < millis() - windowStart) {
+      digitalWrite(PIN_MOP, HIGH && cmdOp);
+      digitalWrite(PIN_MCL, HIGH && cmdCl);
+    } else {
+      digitalWrite(PIN_MCL, LOW);
+      digitalWrite(PIN_MOP, LOW);
+    }
   }
 
   if(!isOff && digitalRead(PIN_OFF)) { // switch changed to open
@@ -609,9 +674,7 @@ void loop() {
     lcdClear();
   }
 
-  // TODO: do this with bytes so it's simultaneous
-  digitalWrite(PIN_MOP, cmdOp);
-  digitalWrite(PIN_MCL, cmdCl);
-
   lcdDraw(cmdOp, cmdCl, pctPV, pctSP, !isOff);
+  if((millis()-loopStart)>99) { Serial.println(millis()-loopStart); }
+  loopStart = millis();
 }
