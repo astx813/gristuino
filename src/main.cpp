@@ -5,11 +5,13 @@
 
 #define PIN_PV          0
 #define PIN_SP          1
-#define PIN_MCL         6
-#define PIN_MOP         7
-#define PIN_SELECT      23
-#define PIN_MENU        25
-#define PIN_OFF         27
+#define PIN_CLOSED      5     // HIGH = on
+#define PIN_MCL         6     // HIGH = on
+#define PIN_MOP         7     // HIGH = on
+#define PIN_OFF         28    // HIGH = system on TODO: make this an actual power switch
+#define PIN_SELECT      26    // LOW  = pressed
+#define PIN_MENU        24    // LOW  = pressed
+#define PIN_ENABLE      22    // LOW  = switch on
 #define CMD           0xFE
 #define LONG_PRESS      1750
 #define LONGLONG_PRESS  4250
@@ -33,8 +35,9 @@ struct eeprom_config {
   int fullyOpened;
   int fullyOn;
   int fullyOff;
-  int hysH;
-  int hysL;
+  int closedLimit;
+  int hysStart;
+  int hysStop;
   int pvSmoothWeight;
   int spSmoothWeight;
   int ver;
@@ -44,16 +47,18 @@ struct eeprom_config {
 // parameters
 ExponentialFilter<long> pvSmooth(80,0);
 ExponentialFilter<long> spSmooth(80,0);
-
+unsigned int loopcount = 0;
 eeprom_config settings;
 int valSP = 0;      // SP pot raw value
-double pctSP = 0;      // SP scaled to %
+int pctSP = 0;      // SP scaled to %
 int valPV = 0;      // PV pot raw value
-double pctPV = 0;      // PV scaled to %
+int pctPV = 0;      // PV scaled to %
+bool poweredOff = false;
 bool cmdOp = false; // send Open signal
 bool cmdCl = false; // send Close signal
-bool isOff = true;  // Main toggle switch PIN_OFF
+bool isOff = true;  // Main toggle switch PIN_ENABLE
 bool configError = true;// error loading from EEPROM
+bool needCalibration = false;
 bool menuMode = false;  //
 menus menuPage;     // Current menu page for button logic
 int menuButton = 0; // button status 0=up, 1=short, 2=long
@@ -65,21 +70,22 @@ bool displayChange = true;        // flag to trigger redraw
 
 // PID additions
 double pidProportion = 0;
-double Kp =0.5, Ki=0.5, Kd=0;
+double Kp=0.4, Ki=2, Kd=0;       // if I want separate open & close tunings
 double pvError = 0;
-PID gatePID(&pctPV, &pidProportion, &pctSP, Kp, Ki, Kd, P_ON_M, DIRECT);
-unsigned int windowSize = 2500;      // How long of a PTC window. Op/Cl ratio will be of this time
+PID gatePID(&pvError, &pidProportion, 0, Kp, Ki, Kd, P_ON_M, REVERSE);
+unsigned int windowSize = 1000;      // How long of a PTC window. Op/Cl ratio will be of this time
 unsigned long windowStart;  // Start time of current PTC window
 unsigned long loopStart;    // DEBUG
 bool pidMode = MANUAL;
 
 void defaultConfig() {
-  settings.fullyClosed = 610;
-  settings.fullyOpened = 105;
-  settings.fullyOn     = 993;
-  settings.fullyOff    = 53;
-  settings.hysH        = 1;
-  settings.hysL        = 1;
+  settings.fullyClosed = 611;
+  settings.fullyOpened = 102;
+  settings.fullyOn     = 1022;
+  settings.fullyOff    = 0;
+  settings.closedLimit = 0;
+  settings.hysStart    = 10;
+  settings.hysStop     = 5;
   settings.pvSmoothWeight = 60;
   settings.spSmoothWeight = 80;
   settings.ver         = 0;
@@ -106,8 +112,8 @@ void loadConfig() {
   Serial.print("\tOpened: \t"); Serial.println(settings.fullyOpened);
   Serial.print("On: \t\t");     Serial.print(settings.fullyOn);
   Serial.print("Off: \t\t");    Serial.println(settings.fullyOff);
-  Serial.print("Hys H/L: \t");  Serial.print(settings.hysH);
-  Serial.print("/");            Serial.println(settings.hysL);
+  Serial.print("Start/Stop: \t");  Serial.print(settings.hysStart);
+  Serial.print("/");            Serial.println(settings.hysStop);
   Serial.print("Weight SP/PV\t"); Serial.print(settings.spSmoothWeight);
   Serial.print("/");            Serial.println(settings.pvSmoothWeight);
   pvSmooth.SetWeight(settings.pvSmoothWeight);
@@ -206,6 +212,11 @@ void lcdShiftR() {
   Serial3.write(0x56);
 }
 void lcdDraw(bool op, bool cl, int pv, int sp, bool enabled) {
+  // Serial.print("drawing: op"); Serial.print(op);
+  // Serial.print(" cl"); Serial.print(cl);
+  // Serial.print(" pv"); Serial.print(pv);
+  // Serial.print(" sp"); Serial.print(sp);
+  // Serial.print(" enabled? "); Serial.print(enabled);
   if (!enabled) { // draw giant OFF
     lcdPos(0x00);
     Serial3.write(0x04);
@@ -544,18 +555,36 @@ void setup() {
     // initialize pins
     pinMode(PIN_MENU, INPUT_PULLUP);
     pinMode(PIN_SELECT, INPUT_PULLUP);
+    pinMode(PIN_ENABLE, INPUT_PULLUP);
     pinMode(PIN_OFF, INPUT_PULLUP);
+    pinMode(PIN_PV, INPUT);
+    pinMode(PIN_SP, INPUT);
+    pinMode(PIN_CLOSED, OUTPUT);
     pinMode(PIN_MOP, OUTPUT);   // off immediately
     pinMode(PIN_MCL, OUTPUT);   // off immediately
     digitalWrite(PIN_MOP, LOW);
     digitalWrite(PIN_MCL, LOW);
-    pinMode(PIN_PV, INPUT);
-    pinMode(PIN_SP, INPUT);
+    digitalWrite(PIN_CLOSED, LOW);
 
+    // test for button press indicating a reload
+    if(digitalRead(PIN_MENU)==LOW && digitalRead(PIN_ENABLE)==HIGH) { // holding a button, delay and see if still held
+      lcdPos(0x00); Serial3.print("Resetting in 5s...");
+      delay(2500);
+      if(digitalRead(PIN_MENU!=HIGH)) { // still holding...
+        lcdPos(0x00); Serial3.print("Halfway there...  ");
+        delay(2500);
+        if(digitalRead(PIN_MENU==LOW)) { // OK, that's long enough
+        // if(digitalRead(PIN_ENABLE==LOW)) { // don't go resetting while enabled!}
+        //   lcdPrint("Not safe to reset","with system enabled.","Turn switch off"," and try again.");
+        // } else
+          defaultConfig();
+          saveConfig();
+        }
+      } else { lcdPos(0x00); Serial3.print("Nevermind!   ");}
+    }
     // initialize filters
     pvSmooth.SetCurrent(analogRead(PIN_PV));
     spSmooth.SetCurrent(analogRead(PIN_SP));
-
     // initialize display (custom chars)
     lcdPos(0x40); Serial3.print("  Customizing LCD");
     lcdPos(0x40);
@@ -574,7 +603,7 @@ void setup() {
     lcdClear();
 
     // activate PID
-    gatePID.SetOutputLimits(-windowSize,windowSize);
+    gatePID.SetOutputLimits(0,windowSize);
     // gatePID.SetSampleTime(250); // default is already 100
     gatePID.SetMode(pidMode);
 
@@ -586,95 +615,135 @@ void setup() {
 }
 
 void loop() {
-  // poll events
+  if(digitalRead(PIN_OFF)==HIGH && !poweredOff) { // Put Braumat in control
+    digitalWrite(PIN_MOP, LOW);
+    digitalWrite(PIN_MCL, LOW);
+    lcdPrint("System off","Braumat in control","      (short D28-GND","       to override)");
+    poweredOff = true;
+  }
+  if(digitalRead(PIN_OFF)==LOW && poweredOff) {   // reclaim control
+    lcdPrint("re-enabling","","","");
+    delay(2000);
+    if(digitalRead(PIN_OFF)==LOW) {             // give a few seconds to say "oh shit"
+      poweredOff = false;
+      lcdClear();
+    } else {
+      lcdPrint("System still off","Braumat in control","      (short D28-GND","       to override)");
+    }
+  }
+  if (poweredOff) return;                         // if we're off, exit immediately
+
+  // poll events (buttons and pots)
   menuButton = checkMenuButton();
   selButton = checkSelButton();
   spSmooth.Filter(analogRead(PIN_SP));
   pvSmooth.Filter(analogRead(PIN_PV));
+  if(!isOff && digitalRead(PIN_ENABLE)) {   // set on/off
+    isOff = true;
+   } else if (isOff && !digitalRead(PIN_ENABLE)) {
+    isOff = false;
+    lcdClear();
+  }
+
   // Menu branches all lead to early return
-  if (menuMode) {                           // In menu mode
+  if (menuMode) {                           // IN menu mode (exit after)
     digitalWrite(PIN_MOP, LOW);             //   STOP MOVING
     digitalWrite(PIN_MCL, LOW);             //   STOP MOVING
-    if (selButton > 0 || menuButton > 0) {  //   and a button has been pressed
-      menuUpdate(false);                    //     update display
+    if (selButton > 0 || menuButton > 0) {  //   act if a button is pressed
+      menuUpdate(false);
     }
     return;                                 // do no more processing
-  } else if (menuButton == 2) {             // long menu press
-    menuMode = true;                        //   enter menu mode
-    menuUpdate(true);                       //   - first run
+  }
+  else if (menuButton == 2) {               // ACTIVATING menu mode (exit after)
+    menuMode = true;                        //   set flag
+    menuUpdate(true);                       //   call first-run menu
+    needCalibration = false;                //   clear calibration flag
     return;                                 //   do no more processing
   }
 
-  // only non-menu mode stuff below here
+  // scale SP/PV to %, check for over/under-range
   pctSP = map(spSmooth.Current(),settings.fullyOff,settings.fullyOn,0,100);
   pctPV = map(pvSmooth.Current(),settings.fullyClosed,settings.fullyOpened,0,100);
-  //pvError = abs(pctSP - pctPV);   // how far out of position are we either way?
-  gatePID.Compute();
-  Serial.print(pidProportion);
-  // TODO get rid of H & L?
-  // if(!cmdOp && !cmdCl && (pvError > settings.hysH)) { // holding out of position
-  pidMode = gatePID.GetMode();
-  if(pidMode==MANUAL && (pvError > settings.hysH)) { // stopped & out of position
-    Serial.print("Enabling ");
-    pidMode = AUTOMATIC;                             //  start moving
-    gatePID.SetMode(pidMode);
-    gatePID.Compute();
-    // BAD BAD BAD TODO: direction can't change while PID is active
-    // if (pctSP > pctPV) {                              //   in the right direction
-    //   cmdOp = true; cmdCl = false;
-    // } else if (pctSP < pctPV) {
-    //   cmdCl = true; cmdOp = false;
-    // }
-  } else if((pidMode==AUTOMATIC) && (pidProportion < 125)) { // moving & less than one frame out of position
-    Serial.println("PID off");
-    pidMode = MANUAL;                           //  quit moving
-    gatePID.SetMode(pidMode);
-  } // not addressed: moving & out of position, stopped & in position
-
-  if(pidMode == AUTOMATIC) {    // Still moving, cuz we would have stopped if in range
-    if (pctSP > pctPV) {                              //   set direction
-      cmdOp = true; cmdCl = false;
-    } else if (pctSP < pctPV) {
-      cmdCl = true; cmdOp = false;
-    }
-  } else {
-    cmdOp = false; cmdCl = false;                      //  in either direction
-    pidProportion = 0;
+  if(pctPV < 0 || pctPV > 100 || pctSP < 0 || pctSP > 100) {  // calibration needed?
+    needCalibration = true; // flag cleared by entering menu mode or resetting
   }
-  if(isOff) {         // override everything, turn PID back off
+
+  if (pctPV<=settings.closedLimit) {      // send Braumat (!)closed signal
+    digitalWrite(PIN_CLOSED,HIGH);
+   } else {
+    digitalWrite(PIN_CLOSED,LOW);
+  }
+
+  if(isOff) {         // PID & motors off, update display (exit after)
     pidMode = MANUAL;
     gatePID.SetMode(pidMode);
     digitalWrite(PIN_MOP, LOW);
     digitalWrite(PIN_MCL, LOW);
     cmdOp = false;
     cmdCl = false;
+    lcdDraw(cmdOp, cmdCl, pctPV, pctSP, !isOff);
+    Serial.print("off");
+    return;
   }
-// DEBUG
-  // if (millis() - windowStart > 100) {
-  //   Serial.println(millis()-windowStart);
-  // }
-  if(pidMode == AUTOMATIC) {
-    gatePID.Compute();
-    if (millis() - windowStart > windowSize) { //time to shift the Relay Window
-      windowStart += windowSize;                 // shift window from end time, not now time
+
+  // we got this far, so we're not off. run the PID
+  pvError = abs(pctSP - pctPV);   // how far out of position are we?
+  pidMode = gatePID.GetMode();    // is PID on?
+  // If we're not moving, should we? If we are, should we stop?
+  if(pidMode==MANUAL && (pvError >= settings.hysStart)) {           // stopped & out of position, activate
+    Serial.println(); Serial.print("Loop "); Serial.print(loopcount); Serial.print(":");
+    Serial.print("PID on... ");
+    pidMode = AUTOMATIC;                                  //  activate PID
+    gatePID.SetMode(pidMode);
+    //pidProportion = windowSize;                      // force full on?
+  }
+  else if((pidMode==AUTOMATIC) && (pvError <= settings.hysStop)) {  // moving  & near position... maybe deactivate
+    if(pctSP==0 && pctPV>0) {                                       //  Close all the way
+      Serial.println(); Serial.print("Loop "); Serial.print(loopcount); Serial.print(":");
+      Serial.print("SP 0%, error<=hysStop ");
     }
-    if (pidProportion < millis() - windowStart) {
+    else {                                                          //  deactivate PID
+      Serial.println(); Serial.print("Loop "); Serial.print(loopcount); Serial.print(":");
+      Serial.print("PID off");
+      pidMode = MANUAL;
+      gatePID.SetMode(pidMode);
+    }
+  } // not addressed: moving & out of position, stopped & in position
+
+  if(pidMode == AUTOMATIC) {                  // ACTIVE? Calc PTC & direction, update relays
+    gatePID.Compute();                        //  recompute PTC %
+    Serial.println(); Serial.print("Loop "); Serial.print(loopcount); Serial.print(":");
+    Serial.print("proportion "); Serial.print(pidProportion);
+    if (millis() - windowStart > windowSize) {// PTC window expired? Shift it
+      windowStart += windowSize;              //  shift window from END TIME to stay true
+    }
+    if (pctSP > pctPV) {                      //  determine direction & set cmd flags
+      cmdOp = true; cmdCl = false;
+     } else if (pctSP < pctPV) {
+      cmdCl = true; cmdOp = false;
+     } else {                         //   shouldn't get here logically, but CYA
+      cmdCl = false; cmdOp = false;
+    }
+    if (pidProportion < millis() - windowStart) { // update relays within PTC window
       digitalWrite(PIN_MOP, HIGH && cmdOp);
       digitalWrite(PIN_MCL, HIGH && cmdCl);
-    } else {
+     } else {
       digitalWrite(PIN_MCL, LOW);
       digitalWrite(PIN_MOP, LOW);
     }
   }
-
-  if(!isOff && digitalRead(PIN_OFF)) { // switch changed to open
-    isOff = true;
-  } else if (isOff && !digitalRead(PIN_OFF)) { // switch changed closed
-    isOff = false;
-    lcdClear();
+  else {                                      // MANUAL - all stop
+    cmdOp = false; cmdCl = false;
+    digitalWrite(PIN_MCL, LOW);
+    digitalWrite(PIN_MOP, LOW);
+    pidProportion = 0;              // override proportion, just in case
   }
 
   lcdDraw(cmdOp, cmdCl, pctPV, pctSP, !isOff);
-  if((millis()-loopStart)>99) { Serial.println(millis()-loopStart); }
+  if((millis()-loopStart)>100) {
+    Serial.print("long loop execution time: ");
+    Serial.println(millis()-loopStart);
+  }
   loopStart = millis();
+  loopcount++;
 }
