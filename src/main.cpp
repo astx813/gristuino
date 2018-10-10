@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <Filter.h>
 #include <EEPROM.h> // Settings storage based on https://gitlab.com/snippets/1728275
-#include <PID_v1.h>
 
 #define PIN_PV          0
 #define PIN_SP          1
@@ -47,6 +46,7 @@ struct eeprom_config {
 // parameters
 ExponentialFilter<long> pvSmooth(80,0);
 ExponentialFilter<long> spSmooth(80,0);
+ExponentialFilter<long> avgCycleTime(20,100);
 unsigned int loopcount = 0;
 eeprom_config settings;
 int valSP = 0;      // SP pot raw value
@@ -54,6 +54,7 @@ int pctSP = 0;      // SP scaled to %
 int valPV = 0;      // PV pot raw value
 int pctPV = 0;      // PV scaled to %
 bool poweredOff = false;
+bool moving = false;
 bool cmdOp = false; // send Open signal
 bool cmdCl = false; // send Close signal
 bool isOff = true;  // Main toggle switch PIN_ENABLE
@@ -68,15 +69,13 @@ unsigned int longPressM = LONG_PRESS;      // Menu button long press ms
 unsigned int longPressS = LONGLONG_PRESS;  // Sel button long press ms
 bool displayChange = true;        // flag to trigger redraw
 
-// PID additions
-double pidProportion = 0;
-double Kp=0.4, Ki=2, Kd=0;       // if I want separate open & close tunings
-double pvError = 0;
-PID gatePID(&pvError, &pidProportion, 0, Kp, Ki, Kd, P_ON_M, REVERSE);
-unsigned int windowSize = 1000;      // How long of a PTC window. Op/Cl ratio will be of this time
-unsigned long windowStart;  // Start time of current PTC window
-unsigned long loopStart;    // DEBUG
-bool pidMode = MANUAL;
+// motion planning
+int pctError = 0;
+int msError = 0;
+int rawError = 0;
+unsigned long loopStart;
+float rateOp = 0.077;
+float rateCl = -0.069;
 
 void defaultConfig() {
   settings.fullyClosed = 611;
@@ -84,8 +83,8 @@ void defaultConfig() {
   settings.fullyOn     = 1022;
   settings.fullyOff    = 0;
   settings.closedLimit = 0;
-  settings.hysStart    = 10;
-  settings.hysStop     = 5;
+  settings.hysStart    = 5;
+  settings.hysStop     = 2;
   settings.pvSmoothWeight = 60;
   settings.spSmoothWeight = 80;
   settings.ver         = 0;
@@ -546,7 +545,7 @@ void menuUpdate(bool newmenu) {
 
 void setup() {
     // Initialize serials
-    Serial.begin(9600);
+    Serial.begin(115200);
     Serial.println("Starting up");
     Serial3.begin(9600);
     lcdBlink(true);
@@ -570,17 +569,19 @@ void setup() {
     if(digitalRead(PIN_MENU)==LOW && digitalRead(PIN_ENABLE)==HIGH) { // holding a button, delay and see if still held
       lcdPos(0x00); Serial3.print("Resetting in 5s...");
       delay(2500);
-      if(digitalRead(PIN_MENU!=HIGH)) { // still holding...
-        lcdPos(0x00); Serial3.print("Halfway there...  ");
+      if(digitalRead(PIN_MENU==LOW)) { // still holding...
+        lcdPos(0x40); Serial3.print("Halfway there...");
         delay(2500);
         if(digitalRead(PIN_MENU==LOW)) { // OK, that's long enough
         // if(digitalRead(PIN_ENABLE==LOW)) { // don't go resetting while enabled!}
         //   lcdPrint("Not safe to reset","with system enabled.","Turn switch off"," and try again.");
         // } else
+          lcdPos(0x14); Serial3.print("LOADING DEFAULTS");
           defaultConfig();
           saveConfig();
-        }
-      } else { lcdPos(0x00); Serial3.print("Nevermind!   ");}
+          delay(500);
+        } else { lcdPos(0x14); Serial3.print("Nevermind!"); delay(250);}
+      } else { lcdPos(0x14); Serial3.print("Nevermind!"); delay(250);}
     }
     // initialize filters
     pvSmooth.SetCurrent(analogRead(PIN_PV));
@@ -602,15 +603,10 @@ void setup() {
     loadConfig();
     lcdClear();
 
-    // activate PID
-    gatePID.SetOutputLimits(0,windowSize);
-    // gatePID.SetSampleTime(250); // default is already 100
-    gatePID.SetMode(pidMode);
-
     // Ready to rock!
-    windowStart = millis();
+    loopStart = millis();
     Serial.print("Startup complete after ");
-    Serial.print(windowStart);
+    Serial.print(loopStart);
     Serial.println("ms");
 }
 
@@ -638,10 +634,13 @@ void loop() {
   selButton = checkSelButton();
   spSmooth.Filter(analogRead(PIN_SP));
   pvSmooth.Filter(analogRead(PIN_PV));
-  if(!isOff && digitalRead(PIN_ENABLE)) {   // set on/off
+  if(!isOff && digitalRead(PIN_ENABLE)) {   // set on/off flag
     isOff = true;
+    Serial.println(F("Switching off"));
    } else if (isOff && !digitalRead(PIN_ENABLE)) {
     isOff = false;
+    loopStart = millis(); // reset loopstart, it hasn't moved this whole itme
+    Serial.println(F("Switching on"));
     lcdClear();
   }
 
@@ -675,74 +674,61 @@ void loop() {
   }
 
   if(isOff) {         // PID & motors off, update display (exit after)
-    pidMode = MANUAL;
-    gatePID.SetMode(pidMode);
     digitalWrite(PIN_MOP, LOW);
     digitalWrite(PIN_MCL, LOW);
     cmdOp = false;
     cmdCl = false;
     lcdDraw(cmdOp, cmdCl, pctPV, pctSP, !isOff);
-    Serial.print("off");
     return;
   }
 
-  // we got this far, so we're not off. run the PID
-  pvError = abs(pctSP - pctPV);   // how far out of position are we?
-  pidMode = gatePID.GetMode();    // is PID on?
+  // we got this far, so we're not off. Decide some movement!
+  rawError = spSmooth.Current() - pvSmooth.Current(); // how far out of position?
+  pctError = pctSP - pctPV;                           // in pct?
+  if(rawError > 0) { msError = rawError/rateOp; }     // in ms?
+  else if(rawError < 0) { msError = abs(rawError/rateCl); }// or ms (closing)
+  else { msError = 0; }                               // that really shouldn't happen
+  Serial.println(); Serial.print("Loop "); Serial.print(loopcount);
+  Serial.print("- SP "); Serial.print(spSmooth.Current());
+  Serial.print(" PV "); Serial.print(pvSmooth.Current());
+  Serial.print(" raw "); Serial.print(rawError);
+  Serial.print(" pct "); Serial.print(pctError);
+  Serial.print(" ms "); Serial.print(msError);
   // If we're not moving, should we? If we are, should we stop?
-  if(pidMode==MANUAL && (pvError >= settings.hysStart)) {           // stopped & out of position, activate
-    Serial.println(); Serial.print("Loop "); Serial.print(loopcount); Serial.print(":");
-    Serial.print("PID on... ");
-    pidMode = AUTOMATIC;                                  //  activate PID
-    gatePID.SetMode(pidMode);
-    //pidProportion = windowSize;                      // force full on?
+  if(!moving && (msError >= settings.hysStart * avgCycleTime.Current())) {  // stopped & out of position, activate
+    Serial.print("\tMove ");
+    moving = true;
   }
-  else if((pidMode==AUTOMATIC) && (pvError <= settings.hysStop)) {  // moving  & near position... maybe deactivate
-    if(pctSP==0 && pctPV>0) {                                       //  Close all the way
-      Serial.println(); Serial.print("Loop "); Serial.print(loopcount); Serial.print(":");
-      Serial.print("SP 0%, error<=hysStop ");
+  else if(moving && (msError <= settings.hysStop * avgCycleTime.Current())) {    // moving & near position... maybe deactivate
+    if(pctSP<=0 && pctPV>0) {                                       //  Close all the way
+      Serial.print("\tkeep closing ");
     }
     else {                                                          //  deactivate PID
-      Serial.println(); Serial.print("Loop "); Serial.print(loopcount); Serial.print(":");
-      Serial.print("PID off");
-      pidMode = MANUAL;
-      gatePID.SetMode(pidMode);
+      Serial.print("\tStop ");
+      moving = false;
     }
   } // not addressed: moving & out of position, stopped & in position
 
-  if(pidMode == AUTOMATIC) {                  // ACTIVE? Calc PTC & direction, update relays
-    gatePID.Compute();                        //  recompute PTC %
-    Serial.println(); Serial.print("Loop "); Serial.print(loopcount); Serial.print(":");
-    Serial.print("proportion "); Serial.print(pidProportion);
-    if (millis() - windowStart > windowSize) {// PTC window expired? Shift it
-      windowStart += windowSize;              //  shift window from END TIME to stay true
-    }
+  if(moving) {                  // ACTIVE? Calc PTC & direction, update relays
     if (pctSP > pctPV) {                      //  determine direction & set cmd flags
-      cmdOp = true; cmdCl = false;
+      cmdOp = true; cmdCl = false; Serial.print("open");
      } else if (pctSP < pctPV) {
-      cmdCl = true; cmdOp = false;
+      cmdCl = true; cmdOp = false; Serial.print("close");
      } else {                         //   shouldn't get here logically, but CYA
-      cmdCl = false; cmdOp = false;
+      cmdCl = false; cmdOp = false; Serial.print("fork");
     }
-    if (pidProportion < millis() - windowStart) { // update relays within PTC window
-      digitalWrite(PIN_MOP, HIGH && cmdOp);
-      digitalWrite(PIN_MCL, HIGH && cmdCl);
-     } else {
-      digitalWrite(PIN_MCL, LOW);
-      digitalWrite(PIN_MOP, LOW);
-    }
-  }
-  else {                                      // MANUAL - all stop
-    cmdOp = false; cmdCl = false;
+    digitalWrite(PIN_MOP, HIGH && cmdOp);
+    digitalWrite(PIN_MCL, HIGH && cmdCl);
+  } else {
     digitalWrite(PIN_MCL, LOW);
     digitalWrite(PIN_MOP, LOW);
-    pidProportion = 0;              // override proportion, just in case
   }
 
   lcdDraw(cmdOp, cmdCl, pctPV, pctSP, !isOff);
-  if((millis()-loopStart)>100) {
-    Serial.print("long loop execution time: ");
-    Serial.println(millis()-loopStart);
+  avgCycleTime.Filter(millis()-loopStart);
+  if((millis()-loopStart)>150) {
+    Serial.println("long loop execution time: ");
+    Serial.print(millis()-loopStart);
   }
   loopStart = millis();
   loopcount++;
