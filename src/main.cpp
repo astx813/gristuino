@@ -44,15 +44,17 @@ struct eeprom_config {
 };
 
 // parameters
-ExponentialFilter<long> pvSmooth(80,0);
+ExponentialFilter<long> pvSmooth(50,0);
 ExponentialFilter<long> spSmooth(80,0);
-ExponentialFilter<long> avgCycleTime(20,100);
+ExponentialFilter<long> avgCycleTime(20,0);
 unsigned int loopcount = 0;
 eeprom_config settings;
 int valSP = 0;      // SP pot raw value
 int pctSP = 0;      // SP scaled to %
+int lastSP = 0;
 int valPV = 0;      // PV pot raw value
 int pctPV = 0;      // PV scaled to %
+int stableCycles = 0;
 bool poweredOff = false;
 bool moving = false;
 bool cmdOp = false; // send Open signal
@@ -70,38 +72,39 @@ unsigned int longPressS = LONGLONG_PRESS;  // Sel button long press ms
 bool displayChange = true;        // flag to trigger redraw
 
 // motion planning
-int pctError = 0;
+// int pctError = 0;
 int msError = 0;
 int rawError = 0;
 unsigned long loopStart;
+unsigned long stepTime = 250;
+unsigned long lastStep = 0;
 float rateOp = 0.077;
 float rateCl = -0.069;
 
 void defaultConfig() {
-  settings.fullyClosed = 611;
+  settings.fullyClosed = 605; // was 611
   settings.fullyOpened = 102;
   settings.fullyOn     = 1022;
   settings.fullyOff    = 0;
   settings.closedLimit = 0;
-  settings.hysStart    = 5;
-  settings.hysStop     = 2;
-  settings.pvSmoothWeight = 60;
+  settings.hysStart    = 15;
+  settings.hysStop     = 5;
   settings.spSmoothWeight = 80;
+  settings.pvSmoothWeight = 80;
   settings.ver         = 0;
 }
 void loadConfig() {
-  Serial.print("Loading config: checksum ");
+  Serial.print("Loading config ");
   settings.checksum = 0;
-  unsigned int sum = 0;
-  unsigned char t;
-  for(unsigned int i=0; i<sizeof(settings); i++) {
-    t = (unsigned char)EEPROM.read(i);
-    *((char *)&settings + i) = t;
-    if(i < sizeof(settings) - sizeof(settings.checksum)) {
-      sum = sum + t;
-    }
-  }
-  Serial.println(sum);
+  unsigned int sum = 99;
+  // unsigned char t;
+  // for(unsigned int i=0; i<sizeof(settings); i++) {
+  //   t = (unsigned char)EEPROM.read(i);
+  //   *((char *)&settings + i) = t;
+  //   if(i < sizeof(settings) - sizeof(settings.checksum)) {
+  //     sum = sum + t;
+  //   }
+  // }
   if(settings.checksum != sum) {
     Serial.println("Checksum fail, loading default config");
     configError = true;
@@ -113,10 +116,10 @@ void loadConfig() {
   Serial.print("Off: \t\t");    Serial.println(settings.fullyOff);
   Serial.print("Start/Stop: \t");  Serial.print(settings.hysStart);
   Serial.print("/");            Serial.println(settings.hysStop);
-  Serial.print("Weight SP/PV\t"); Serial.print(settings.spSmoothWeight);
-  Serial.print("/");            Serial.println(settings.pvSmoothWeight);
-  pvSmooth.SetWeight(settings.pvSmoothWeight);
-  spSmooth.SetWeight(settings.spSmoothWeight);
+  // Serial.print("Weight SP/PV\t"); Serial.print(settings.spSmoothWeight);
+  // Serial.print("/");            Serial.println(settings.pvSmoothWeight);
+  // pvSmooth.SetWeight(settings.pvSmoothWeight);
+  // spSmooth.SetWeight(settings.spSmoothWeight);
 }
 void saveConfig() {
   Serial.print("Saving config. checksum: ");
@@ -582,6 +585,7 @@ void setup() {
     // initialize filters
     pvSmooth.SetCurrent(analogRead(PIN_PV));
     spSmooth.SetCurrent(analogRead(PIN_SP));
+    avgCycleTime.SetCurrent(200);
     // initialize display (custom chars)
     lcdPos(0x40); Serial3.print("  Customizing LCD");
     lcdPos(0x40);
@@ -661,6 +665,8 @@ void loop() {
   pctPV = map(pvSmooth.Current(),settings.fullyClosed,settings.fullyOpened,0,100);
   if(pctPV < 0 || pctPV > 100 || pctSP < 0 || pctSP > 100) {  // calibration needed?
     needCalibration = true; // flag cleared by entering menu mode or resetting
+    pctPV = constrain(pctPV,0,100);
+    pctSP = constrain(pctSP,0,100);
   }
 
   if (pctPV<=settings.closedLimit) {      // send Braumat (!)closed signal
@@ -679,46 +685,68 @@ void loop() {
   }
 
   // we got this far, so we're not off. Decide some movement!
-  rawError = spSmooth.Current() - pvSmooth.Current(); // how far out of position?
-  pctError = pctSP - pctPV;                           // in pct?
-  if(rawError > 0) { msError = rawError/rateOp; }     // in ms?
-  else if(rawError < 0) { msError = abs(rawError/rateCl); }// or ms (closing)
-  else { msError = 0; }                               // that really shouldn't happen
-  Serial.println(); Serial.print("Loop "); Serial.print(loopcount);
-  Serial.print(" - SP "); Serial.print(spSmooth.Current());
-  Serial.print(" PV "); Serial.print(pvSmooth.Current());
-  Serial.print(" raw "); Serial.print(rawError);
-  Serial.print(" pct "); Serial.print(pctError);
-  Serial.print(" ms "); Serial.print(msError);
-  // If we're not moving, should we? If we are, should we stop?
-  if(!moving && (msError >= settings.hysStart * avgCycleTime.Current())) {  // stopped & out of position, activate
-    Serial.print("\tMove ");
-    moving = true;
+  //rawError = spSmooth.Current() - pvSmooth.Current(); // how far out of position? WRONG!
+  // raw error isn't SP-PV! it's [SP scaled to the PV range] - PV
+  rawError = abs(map(pctSP,0,100,settings.fullyClosed,settings.fullyOpened) - pvSmooth.Current());
+  //pctError = pctSP - pctPV;                           // in pct? not sure we'll even need this
+  if(abs(pctSP-lastSP)>=2) {  // SP has officially changed
+    stableCycles = 0;
+    lastSP = pctSP;
   }
-  else if(moving && (msError <= settings.hysStop * avgCycleTime.Current())) {    // moving & near position... maybe deactivate
-    if(pctSP<=0 && pctPV>0) {                                       //  Close all the way
-      Serial.print("\tkeep closing ");
-    }
-    else {                                                          //  deactivate PID
-      Serial.print("\tStop ");
-      moving = false;
-    }
-  } // not addressed: moving & out of position, stopped & in position
+  if(pctSP > pctPV) { msError = abs(rawError/rateOp); }     // open ms FIXED: was comparing raw values, which screws up with -/+
+  else if(pctSP < pctPV) { msError = abs(rawError/rateCl); }// close ms
+  else { msError = 0; }                                     // that really shouldn't happen
+  if(millis()-lastStep > stepTime) { // time has passed, check state of affairs
+    Serial.println(); Serial.print(millis()); //Serial.print(" #"); Serial.print(loopcount);
+    Serial.print(" SP "); Serial.print(pctSP); Serial.print("%/"); Serial.print(map(pctSP,0,100,settings.fullyClosed,settings.fullyOpened));
+    Serial.print(" PV "); Serial.print(pctPV); Serial.print("%/"); Serial.print(pvSmooth.Current());
+    Serial.print("= Err "); Serial.print(rawError);
+    //Serial.print(", pctErr "); Serial.print(pctError);
+    Serial.print(", msErr "); Serial.print(msError);
+    Serial.print(", avgcycle "); Serial.print(avgCycleTime.Current()); Serial.print(", last "); Serial.print(lastStep);
 
-  if(moving) {                  // ACTIVE? Calc direction, update relays
-    if (pctSP > pctPV) {                      //  determine direction & set cmd flags
-      cmdOp = true; cmdCl = false; Serial.print("open");
-     } else if (pctSP < pctPV) {
-      cmdCl = true; cmdOp = false; Serial.print("close");
-     } else {                         //   shouldn't get here logically, but CYA
-      cmdCl = false; cmdOp = false; Serial.print("fork!");
+  // If we're not moving, should we? If we are, should we stop?
+
+    if(!moving && (abs(pctPV-pctSP)>=5)) { //settings.hysStart * avgCycleTime.Current())) {  // stopped & out of position, activate
+      Serial.print("\tMove ");
+      moving = true;
+      if (pctSP > pctPV) {                      //  determine direction & set cmd flags
+        cmdOp = true; cmdCl = false;// Serial.print("open");
+       } else if (pctSP < pctPV) {
+        cmdCl = true; cmdOp = false;// Serial.print("close");
+       } else {                         //   shouldn't get here logically, but CYA
+        cmdCl = false; cmdOp = false; Serial.print("fork!");
+      }
+      digitalWrite(PIN_MOP, HIGH && cmdOp);
+      digitalWrite(PIN_MCL, HIGH && cmdCl);
+      stepTime = msError - 200; // can't be negative, msError is at least 350
+      lastStep = millis();
+      Serial.print(stepTime);
     }
-    digitalWrite(PIN_MOP, HIGH && cmdOp);
-    digitalWrite(PIN_MCL, HIGH && cmdCl);
-  } else {
-    digitalWrite(PIN_MCL, LOW);
-    digitalWrite(PIN_MOP, LOW);
+    else if(moving) { // just stop and re-evaluate after a pause //settings.hysStop * avgCycleTime.Current())) {    // moving & near position... maybe deactivate
+      if(pctSP<=0 && pctPV>0) {                                       //  Close all the way
+        Serial.print("\tkeep closing ");
+        stepTime = 500;
+        lastStep = millis();
+      }
+      else {                                                          //  deactivate PID
+        Serial.print("\tStop ");
+        // pvSmooth.SetCurrent(map(pctSP,0,100,settings.fullyClosed,settings.fullyOpened));
+        moving = false;
+        cmdCl = false; cmdOp = false;
+        digitalWrite(PIN_MOP, LOW);
+        digitalWrite(PIN_MCL, LOW);
+        stepTime = 500;
+        lastStep = millis();
+      }
+    } // not addressed: moving & out of position, stopped & in position
   }
+  // if(moving) {                  // ACTIVE? Calc direction, update relays
+  // } else {
+  //   cmdOp = false; cmdCl = false;
+  //   digitalWrite(PIN_MCL, LOW);
+  //   digitalWrite(PIN_MOP, LOW);
+  // }
 
   lcdDraw(cmdOp, cmdCl, pctPV, pctSP, !isOff);
   avgCycleTime.Filter(millis()-loopStart);
